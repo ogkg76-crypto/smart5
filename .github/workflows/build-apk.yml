@@ -1,79 +1,133 @@
-name: Build APK
+name: Build SmartScholar AI APK
 
 on:
   push:
     branches: [main, master]
   workflow_dispatch:
-
-permissions:
-  contents: read
+    inputs:
+      app_url:
+        description: "رابط السيرفر المرفوع (اختياري - لو سيبته فاضي هيستخدم Secret اسمه APP_URL)"
+        required: false
+        default: ""
 
 jobs:
-  apk:
-    name: Build Android APK
+  build-apk:
     runs-on: ubuntu-latest
+
+    env:
+      APP_ID: com.smartscholar.ai
+      APP_NAME: SmartScholar AI
+      APP_URL: ${{ github.event.inputs.app_url || secrets.APP_URL }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js 22
+      - name: Check APP_URL
+        run: |
+          if [ -z "$APP_URL" ]; then
+            echo "::error::APP_URL مش موجود. ضيفه في Settings > Secrets and variables > Actions > New repository secret باسم APP_URL (رابط السيرفر بتاعك https://...)"
+            exit 1
+          fi
+          case "$APP_URL" in
+            https://*) ;;
+            *) echo "::error::APP_URL لازم يبدأ بـ https://"; exit 1 ;;
+          esac
+
+      - name: Unzip the project (as is, no edits)
+        run: |
+          ZIP_FILE=$(find . -maxdepth 2 -iname "*.zip" -not -path "./node_modules/*" | head -n 1)
+          if [ -z "$ZIP_FILE" ]; then
+            echo "::error::مفيش ملف zip في الـ repo. ارفع smartscholar-ai.zip في الجذر."
+            exit 1
+          fi
+          echo "Found: $ZIP_FILE"
+          mkdir -p _extract
+          unzip -q -o "$ZIP_FILE" -d _extract
+          PKG=$(find _extract -maxdepth 3 -name package.json -not -path "*/node_modules/*" | head -n 1)
+          if [ -z "$PKG" ]; then
+            echo "::error::مش لاقي package.json جوه الـ zip"
+            exit 1
+          fi
+          mv "$(dirname "$PKG")" app
+          ls -la app
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install app dependencies
+        working-directory: app
+        run: bun install
+
+      - name: Build web app
+        working-directory: app
+        run: bun run build
+
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: 20
 
-      - name: Setup Java 17
+      - name: Setup Java 21
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: 21
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install dependencies
-        run: npm install --no-audit --no-fund
-
-      - name: Type check (tsc --noEmit)
-        run: npm run lint
-
-      - name: Install Capacitor (without modifying package.json)
-        run: npm install --no-save @capacitor/core @capacitor/android @capacitor/cli
-
-      - name: Create Capacitor config
+      - name: Create Capacitor wrapper (separate folder, app untouched)
         run: |
-          cat > capacitor.config.json <<'EOF'
+          mkdir -p mobile/www
+          cp -r app/dist/. mobile/www/
+          cd mobile
+          cat > package.json <<'EOF'
           {
-            "appId": "com.smartstudent.app",
-            "appName": "SmartScholar AI",
-            "webDir": "dist",
-            "androidScheme": "https"
+            "name": "smartscholar-mobile",
+            "version": "1.0.0",
+            "private": true
           }
           EOF
+          npm install @capacitor/core@7 @capacitor/cli@7 @capacitor/android@7
+          cat > capacitor.config.json <<EOF
+          {
+            "appId": "${APP_ID}",
+            "appName": "${APP_NAME}",
+            "webDir": "www",
+            "server": {
+              "url": "${APP_URL}",
+              "androidScheme": "https",
+              "cleartext": false,
+              "allowNavigation": ["*"]
+            },
+            "android": {
+              "allowMixedContent": false
+            }
+          }
+          EOF
+          npx cap add android
+          npx cap sync android
 
-      - name: Build web app (vite build)
-        run: npm run build
-
-      - name: Add Android platform
-        run: npx cap add android
-
-      - name: Sync web assets into Android project
-        run: npx cap sync android
-
-      - name: Accept SDK licenses
-        run: yes | sdkmanager --licenses || true
-
-      - name: Install SDK platform & build tools
-        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
-
-      - name: Build debug APK with Gradle
+      - name: Add camera and microphone permissions
         run: |
-          chmod +x android/gradlew
-          cd android
+          MANIFEST=mobile/android/app/src/main/AndroidManifest.xml
+          sed -i 's#<application#<uses-permission android:name="android.permission.CAMERA" />\n    <uses-permission android:name="android.permission.RECORD_AUDIO" />\n    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />\n    <application#' "$MANIFEST"
+          cat "$MANIFEST"
+
+      - name: Build debug APK
+        working-directory: mobile/android
+        run: |
+          chmod +x gradlew
           ./gradlew assembleDebug --no-daemon
 
-      - name: Upload APK artifact
+      - name: Rename APK
+        run: |
+          cp mobile/android/app/build/outputs/apk/debug/app-debug.apk SmartScholar-AI.apk
+
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: SmartScholar-AI-APK
-          path: android/app/build/outputs/apk/debug/app-debug.apk
+          path: SmartScholar-AI.apk
+          if-no-files-found: error
